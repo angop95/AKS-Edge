@@ -8,7 +8,11 @@ param(
     [String] $TenantId,
     [ValidateNotNullOrEmpty()]
     [String] $Location,
-    [Switch] $UseK8s,
+    [ValidateNotNullOrEmpty()]
+    [String] $ResourceGroupName,
+    [ValidateNotNullOrEmpty()]
+    [String] $ClusterName,
+    [Switch] $UseK8s=$false,
     [string] $Tag
 )
 #Requires -RunAsAdministrator
@@ -29,6 +33,25 @@ if ($arcLocations -inotcontains $Location) {
     Write-Host "Supported Locations : $arcLocations"
     exit -1
 }
+# Validate az cli version.
+try {
+    $azVersion = (az version)[1].Split(":")[1].Split('"')[1]
+    if ($azVersion -lt "2.38.0"){
+        Write-Host "Installed Azure CLI version $azVersion is older than 2.38.0. Please upgrade Azure CLI and retry." -ForegroundColor Red
+        exit -1
+    }
+}
+catch {
+    Write-Host "Please install Azure CLI version 2.38.0 or newer and retry." -ForegroundColor Red
+    exit -1
+}
+
+# Ensure logged into Azure
+$azureLogin = az account show
+if ( $null -eq $azureLogin){
+    Write-Host "Please login to azure via `az login` and retry." -ForegroundColor Red
+    exit -1
+}
 
 $installDir = $((Get-Location).Path)
 $productName = "AKS Edge Essentials - K3s"
@@ -47,11 +70,11 @@ $aideuserConfig = @"
     "AksEdgeProductUrl": "",
     "Azure": {
         "SubscriptionName": "",
-        "SubscriptionId": "$SubscriptionId",
-        "TenantId": "$TenantId",
-        "ResourceGroupName": "aksedge-rg",
-        "ServicePrincipalName": "aksedge-sp",
-        "Location": "$Location",
+        "SubscriptionId": "",
+        "TenantId": "",
+        "ResourceGroupName": "",
+        "ServicePrincipalName": "",
+        "Location": "",
         "CustomLocationOID":"",
         "Auth":{
             "ServicePrincipalId":"",
@@ -82,7 +105,7 @@ $aksedgeConfig = @"
             "LinuxNode": {
                 "CpuCount": 8,
                 "MemoryInMB": 8192,
-                "DataSizeInGB": 40,
+                "DataSizeInGB": 30,
                 "LogSizeInGB": 4
             }
         }
@@ -106,8 +129,8 @@ Start-Transcript -Path $transcriptFile
 
 Set-ExecutionPolicy Bypass -Scope Process -Force
 # Download the AksEdgeDeploy modules from Azure/AksEdge
-$fork ="Azure"
-$branch="main"
+$fork ="angop95"
+$branch="users/angop/testAioSpecificScript"
 $url = "https://github.com/$fork/AKS-Edge/archive/$branch.zip"
 $zipFile = "AKS-Edge-$branch.zip"
 $workdir = "$installDir\AKS-Edge-$branch"
@@ -140,25 +163,8 @@ Set-Content -Path $aksedgejson -Value $aksedgeConfig -Force
 $aksedgeShell = (Get-ChildItem -Path "$workdir" -Filter AksEdgeShell.ps1 -Recurse).FullName
 . $aksedgeShell
 
-# Setup Azure 
-Write-Host "Step 2: Setup Azure Cloud for Arc connections" -ForegroundColor Cyan
-$azcfg = (Get-AideUserConfig).Azure
-if ($azcfg.Auth.Password) {
-   Write-Host "Password found in json spec. Skipping AksEdgeAzureSetup." -ForegroundColor Cyan
-} else {
-    $aksedgeazuresetup = (Get-ChildItem -Path "$workdir" -Filter AksEdgeAzureSetup.ps1 -Recurse).FullName
-    & $aksedgeazuresetup -jsonFile $aidejson -spContributorRole -spCredReset
-
-    if ($LastExitCode -eq -1) {
-        Write-Host "Error in configuring Azure Cloud for Arc connection" -ForegroundColor Red
-        Stop-Transcript | Out-Null
-        Pop-Location
-        exit -1
-    }
-}
-
 # Download, install and deploy AKS EE 
-Write-Host "Step 3: Download, install and deploy AKS Edge Essentials" -ForegroundColor Cyan
+Write-Host "Step 2: Download, install and deploy AKS Edge Essentials" -ForegroundColor Cyan
 # invoke the workflow, the json file already updated above.
 $retval = Start-AideWorkflow -jsonFile $aidejson
 if ($retval) {
@@ -170,28 +176,33 @@ if ($retval) {
     exit -1
 }
 
-Write-Host "Step 4: Connect to Arc" -ForegroundColor Cyan
-Write-Host "Installing required Az Powershell modules"
-$arcstatus = Initialize-AideArc
-if ($arcstatus) {
-    Write-Host ">Connecting to Azure Arc"
-    if (Connect-AideArc) {
-        Write-Host "Azure Arc connections successful."
-    } else {
-        Write-Host "Error: Azure Arc connections failed" -ForegroundColor Red
-        Stop-Transcript | Out-Null
-        Pop-Location
-        exit -1
-    }
-} 
-else { 
-    Write-Host "Error: Arc Initialization failed." -ForegroundColor Red 
-    Stop-Transcript | Out-Null
-    Pop-Location
-    exit -1
-}
+Write-Host "Step 3: Connect the cluster to Azure" -ForegroundColor Cyan
+# Set the azure subscription
+az account set -s $SubscriptionId
 
-Write-Host "Step 5: Prep for AIO workload deployment" -ForegroundColor Cyan
+# Create resource group
+$rgExists = az group show --resource-group $ResourceGroupName
+if ($null -eq $rgExists) {
+    az group create --location $Location --resource-group $ResourceGroupName --subscription $SubscriptionId
+} 
+
+# Register the required resource providers 
+az provider register -n "Microsoft.ExtendedLocation"
+az provider register -n "Microsoft.Kubernetes"
+az provider register -n "Microsoft.KubernetesConfiguration"
+az provider register -n "Microsoft.IoTOperationsOrchestrator"
+az provider register -n "Microsoft.IoTOperationsMQ"
+az provider register -n "Microsoft.IoTOperationsDataProcessor"
+az provider register -n "Microsoft.DeviceRegistry"
+
+# Arc-enable the Kubernetes cluster
+az connectedk8s connect -n $ClusterName -l $Location -g $ResourceGroupName --subscription $SubscriptionId
+
+# Enable custom location support on your cluster using az connectedk8s enable-features command
+$objectId = az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv
+az connectedk8s enable-features -n $ClusterName -g $ResourceGroupName --custom-locations-oid $objectId --features cluster-connect custom-locations
+
+Write-Host "Step 4: Prep for AIO workload deployment" -ForegroundColor Cyan
 Write-Host "Deploy local path provisioner"
 try {
     $localPathProvisionerYaml= (Get-ChildItem -Path "$workdir" -Filter local-path-storage.yaml -Recurse).FullName
@@ -225,9 +236,8 @@ catch {
 
 Write-Host "Configuring port proxy for AIO"
 try {
-    $deploymentInfo = Get-AksEdgeDeploymentInfo
     # Get the service ip address start to determine the connect address
-    $connectAddress = $deploymentInfo.LinuxNodeConfig.ServiceIpRange.split("-")[0]
+    $connectAddress = kubectl get svc aio-mq-dmqtt-frontend -n azure-iot-operations -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
     $portProxyRulExists = netsh interface portproxy show v4tov4 | findstr /C:"1883" | findstr /C:"$connectAddress"
     if ( $null -eq $portProxyRulExists ) {
         Write-Host "Configure port proxy for AIO"
